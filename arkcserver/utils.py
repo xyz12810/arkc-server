@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+# coding:utf-8
+
 from Crypto.Cipher import AES
 from Crypto.PublicKey import RSA
 from time import time
@@ -15,6 +18,23 @@ from os import SEEK_CUR
 from collections import Callable
 
 
+def int2base(num, base=36, numerals="0123456789abcdefghijklmnopqrstuvwxyz"):
+    if num == 0:
+        return "0"
+
+    if num < 0:
+        return '-' + int2base((-1) * num, base, numerals)
+
+    if not 2 <= base <= len(numerals):
+        raise ValueError('Base must be between 2-%d' % len(numerals))
+
+    left_digits = num // base
+    if left_digits == 0:
+        return numerals[num % base]
+    else:
+        return int2base(left_digits, base, numerals) + numerals[num % base]
+
+
 class certstorage:
     """ A sqlite client to check if fetch certificates, authenticate, and buffer"""
 
@@ -29,14 +49,20 @@ class certstorage:
         # Currently the DB is for appending only
         if sha1_value not in self.db_buffer_dict:
             t = (sha1_value,)
-            self.db_cursor.execute('SELECT * FROM certs WHERE pub_sha1=?', t)
+            self.db_cursor.execute('SELECT * FROM certs WHERE pubkey_sha1=?', t)
             rec = self.db_cursor.fetchone()
-            if len(rec) != 1:
+            if rec is None:
                 return None
             else:
-                key = RSA.importKey(rec[0][2])
+                key = RSA.importKey(rec[2])
                 self.db_buffer_dict[sha1_value] = [key, rec[1]]
         return self.db_buffer_dict[sha1_value]
+    
+    def quick_query(self, sha1_value):
+        if sha1_value in self.db_buffer_dict:
+            return self.db_buffer_dict[sha1_value]
+        else:
+            return None
 
     def close(self):
         try:
@@ -87,24 +113,34 @@ def generate_RSA(pridir, pubdir):
 
 class AESCipher:
     """A reusable wrapper of PyCrypto's AES cipher, i.e. resets every time."""
+    """ BY Teba 2015 """
+
+    # in new version, segment size is 128
 
     def __init__(self, password, iv):
         self.password = password
         self.iv = iv
-        self.reset()
-
-    def reset(self):
-        self.cipher = AES.new(self.password, AES.MODE_CFB, self.iv)
+        try:
+            self.cipher = AES.new(
+                self.password, AES.MODE_CFB, self.iv, segment_size=AES.block_size * 8)
+        except Exception as err:
+            print(err)
+            print(self.password)
+            print(len(self.password))
 
     def encrypt(self, data):
-        enc = self.cipher.encrypt(data)
-        self.reset()
+        raw = data.ljust(16 * (len(data) // 16 + 1), b'\x01')
+        # print( len(raw)) # TEBA: Why I never get the output?
+        enc = self.cipher.encrypt(raw)
+        self.cipher = AES.new(
+            self.password, AES.MODE_CFB, self.iv, segment_size=AES.block_size * 8)
         return enc
 
     def decrypt(self, data):
         dec = self.cipher.decrypt(data)
-        self.reset()
-        return dec
+        self.cipher = AES.new(
+            self.password, AES.MODE_CFB, self.iv, segment_size=AES.block_size * 8)
+        return dec.rstrip(b'\x01')
 
 
 def urlsafe_b64_short_encode(value):

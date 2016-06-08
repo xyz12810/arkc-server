@@ -1,4 +1,5 @@
 #! /usr/bin/env python
+# coding:utf-8
 
 import logging
 import argparse
@@ -20,7 +21,7 @@ from twisted_connect_proxy.server import ConnectProxy
 from coordinator import Coordinator
 from utils import generate_RSA, certstorage
 
-VERSION = "0.2.1"
+VERSION = "0.4.0"
 
 
 def start_proxy(port):
@@ -62,7 +63,7 @@ def main():
 Use this option to support other types of proxy other than HTTP, or use authentication at client-end proxy.
 Fall back to in-built python proxy server otherwise.""")
     print(
-        """ArkC Server V0.2, by ArkC Technology.
+        """ArkC Server V""" + VERSION + """ by ArkC Technology.
 The programs is distributed under GNU General Public License Version 2.
 """)
 
@@ -80,10 +81,10 @@ The programs is distributed under GNU General Public License Version 2.
         sys.exit()
     elif args.dlmeek:
         if sys.platform == 'linux2':
-            link = "https://github.com/projectarkc/meek/releases/download/v0.2/meek-client"
+            link = "https://github.com/projectarkc/meek/releases/download/v0.2.2/meek-client"
             localfile = os.path.expanduser('~') + os.sep + "meek-client"
         elif sys.platform == 'win32':
-            link = "https://github.com/projectarkc/meek/releases/download/v0.2/meek-client.exe"
+            link = "https://github.com/projectarkc/meek/releases/download/v0.2.2/meek-client.exe"
             localfile = os.path.expanduser('~') + os.sep + "meek-client.exe"
         else:
             print(
@@ -199,7 +200,7 @@ The programs is distributed under GNU General Public License Version 2.
         data["socks_proxy"] = None
 
     if "delegated_domain" not in data:
-        data["delegated_domain"] = "testing.arkc.org"
+        data["delegated_domain"] = "public.arkc.org"
 
     if "self_domain" not in data:
         data["self_domain"] = "freedom.arkc.org"

@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+# coding:utf-8
+
 import logging
 
 from os import urandom
@@ -32,7 +35,6 @@ class ClientConnector(Protocol):
         # control characters
         self.split_char = chr(27) + chr(28) + "%X" % struct.unpack('B', self.main_pw[-2:-1])[
             0] + "%X" % struct.unpack('B', self.main_pw[-3:-2])[0] + chr(31)
-        self.pri = self.initiator.initiator.pri
         self.client_pub = self.initiator.client_pub
         self.session_pw = urandom(16)
         self.cipher = AESCipher(self.session_pw, self.main_pw)
@@ -53,10 +55,10 @@ class ClientConnector(Protocol):
             client_pub(session_pw) + id
         Total length is 512 + 256 + 2 = 770 bytes
         """
-        hex_sign = '%X' % self.pri.sign(self.main_pw, None)[0]
         pw_enc = self.client_pub.encrypt(self.session_pw, None)[0]
-        return hex_sign + pw_enc + self.idchar +\
-            repr(self.initiator.client_recv_index_dict[self.i])
+        return '\r\n'.join((self.initiator.signature_to_client, pw_enc,
+                            self.idchar,
+                            repr(self.initiator.client_recv_index_dict[self.i])))
 
     def ping_send(self):
         """Send the initial ping message to the client at a certain interval.
@@ -164,7 +166,7 @@ class ClientConnector(Protocol):
             logging.info("client connection lost: " +
                          addr_to_str(self.transport.getPeer()))
         self.authenticated = False
-        self.initiator.client_lost(self)
+        self.initiator.client_lost(self.i)
 
     def write(self, data, conn_id, index):
         """Encrypt and write data the client.
@@ -176,8 +178,12 @@ class ClientConnector(Protocol):
             index   (6 bytes)
             data
         """
-
-        to_write = self.cipher.encrypt("0" + conn_id + str(index) + data) +\
+        if index < 100000:
+            index = '0' * (6 - len(str(index))) + str(index)
+        else:
+            index = str(index)
+        # get current time with base 36 as a string in a certain length .
+        to_write = self.cipher.encrypt("0" + conn_id + index + data) +\
             self.split_char
         logging.debug("sending %d bytes to client %s with id %s" % (len(data),
                                                                     addr_to_str(

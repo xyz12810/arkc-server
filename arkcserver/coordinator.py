@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+# coding:utf-8
+
 import logging
 import dnslib
 import hashlib
@@ -10,13 +13,11 @@ from twisted.internet.endpoints import TCP4ClientEndpoint
 from control import Control
 import pyotp
 
-from utils import urlsafe_b64_short_decode
+from utils import urlsafe_b64_short_decode, int2base
 
 MAX_SALT_BUFFER = 255
-
-
-class ClientAddrChanged(Exception):
-    pass
+BLACKLIST_EXPIRE_TIME = 7200
+MAX_CONN_PER_CLIENT = 20
 
 
 class DuplicateError(Exception):
@@ -24,6 +25,14 @@ class DuplicateError(Exception):
 
 
 class CorruptedReq(Exception):
+    pass
+
+
+class IllegalReq(Exception):
+    pass
+
+
+class BlacklistReq(Exception):
     pass
 
 
@@ -53,10 +62,12 @@ class Coordinator(DatagramProtocol):
         # dict mapping client sha-1 to (client pub, sha1(client pri))
         self.certs_db = certs_db
 
-        # dict mapping client sha-1 to control
+        # dict mapping <client sha-1> + <main_pw> to control,
         self.controls = dict()
 
         self.recentsalt = []
+        self.blacklist = []
+        self.blacklist_buffer = dict()
 
     def parse_udp_msg(self, *msg):
         """
@@ -75,16 +86,17 @@ class Coordinator(DatagramProtocol):
                 salt,
                 [cert1,
                 cert2   (only when obfs4 is enabled)],
-                [some random string (only when meek is enabled)]
+                [some random string (only when meek is enabled)],
+                type + version
             )
         """
 
-        assert len(msg[0]) == 46    # 2 + 4 + 40
+        assert len(msg[0]) == 48    # 2 + 4 + 40 + 2
 
         if msg[4] in self.recentsalt:
-            return None, None, None, None, None, None
-
-        num_hex, port_hex, client_sha1 = msg[0][:2], msg[0][2:6], msg[0][6:46]
+            raise BlacklistReq
+        num_hex, port_hex, client_sha1 = msg[0][
+            :2], msg[0][2:6], msg[0][6:46]
         h = hashlib.sha256()
         cert = self.certs_db.query(client_sha1)
         if cert is None:
@@ -98,11 +110,15 @@ class Coordinator(DatagramProtocol):
         main_pw = binascii.unhexlify(msg[2])
         number = int(num_hex, 16)
         if number <= 0:
-            number = None
+            raise CorruptedReq
         remote_port = int(port_hex, 16)
         if len(self.recentsalt) >= MAX_SALT_BUFFER:
             self.recentsalt.pop(0)
         self.recentsalt.append(msg[4])
+        if (client_sha1 + main_pw) in self.blacklist:
+            raise BlacklistReq
+        if number > MAX_CONN_PER_CLIENT:
+            raise IllegalReq
 
         if 1 <= self.obfs_level <= 2:
             # obfs4 enabled
@@ -110,41 +126,49 @@ class Coordinator(DatagramProtocol):
             certs_original += '=' * ((160 - len(certs_original)) % 4)
             certs_str = urlsafe_b64_short_decode(certs_original)
         else:
+            assert msg[5][:2] == "0001"
             certs_str = None
-
-        return main_pw, client_sha1, number, remote_port, remote_ip, certs_str
+        signature_to_client = int2base(self.pri.sign(main_pw, None)[0])
+        return main_pw, client_sha1, number, remote_port, remote_ip, certs_str, signature_to_client
 
     def parse_udp_msg_transmit(self, msg):
         """Return (main_pw, client_sha1, number).
          The encrypted message should be
-             salt +
-             required_connection_number (HEX, 2 bytes) +
-             client_listen_port (HEX, 4 bytes) +
-             sha1(local_pub) +
-             client_sign(salt) +
-             server_pub(main_pw) +
-             remote_ip
-         Total length is 16 + 2 + 4 + 40 + 512 + 256 = 830 bytes
-         """
+             salt \r\n
+             required_connection_number (HEX, 2 bytes) \r\n
+             client_listen_port (HEX, 4 bytes) \r\n
+             sha1(local_pub) \r\n
+             client_sign(salt) \r\n
+             server_pub(main_pw) \r\n
+             remote_ip \r\n
+             signature_to_client \r\n
+             version
+        """
 
-        #assert len(msg) == 830
-        salt, number_hex, port_hex, client_sha1, salt_sign_hex, main_pw_enc, remote_ip_enc = \
-            msg[:16], msg[16:18], msg[18:22], msg[
-                22:62], msg[62:574], (msg[574:])[:-7], msg[-7:]
+        msglist = msg.split('\r\n')
+        if len(msglist) != 9:
+            raise CorruptedReq
+        [salt, number_hex, port_hex, client_sha1,
+         salt_sign_hex, main_pw_enc, remote_ip_enc] = msglist
         if salt in self.recentsalt:
-            return (None, None, None, None)
+            return BlacklistReq
         remote_ip = str(
             ipaddress.ip_address(int(remote_ip_enc.rstrip("="), 36)))
-        salt_sign = (int(salt_sign_hex, 16),)
+        salt_sign = (int(salt_sign_hex, 36),)
         number = int(number_hex, 16)
+        if number > MAX_CONN_PER_CLIENT:
+            raise IllegalReq
         remote_port = int(port_hex, 16)
         assert self.central_pub.verify(
             salt + str(number) + remote_ip_enc + str(remote_port), salt_sign)
         main_pw = self.pri.decrypt(main_pw_enc)
+        if len(main_pw) != 16:
+            raise CorruptedReq
         if len(self.recentsalt) >= MAX_SALT_BUFFER:
             self.recentsalt.pop(0)
         self.recentsalt.append(salt)
-
+        if (client_sha1 + main_pw) in self.blacklist:
+            raise BlacklistReq
         # if not self.obfs_level:
         #    certs_str = None
         # else:
@@ -153,25 +177,45 @@ class Coordinator(DatagramProtocol):
         #    certs_original += '=' * ((160 - len(certs_original)) % 4)
         #    certs_str = urlsafe_b64_short_decode(certs_original)
         certs_str = None
-
-        return main_pw, client_sha1, number, remote_port, remote_ip, certs_str
+        signature_to_client = msglist[7]
+        version = msglist[8]
+        return main_pw, client_sha1, number, remote_port, remote_ip, certs_str, signature_to_client
 
     def answer(self, dnsq, addr):
-        answer = dnsq.reply()
-        answer.header = dnslib.DNSHeader(id=dnsq.header.id,
-                                         aa=1, qr=1, ra=1, rcode=3)
-        answer.add_auth(
-            dnslib.RR(
-                self.delegatedomain,
-                dnslib.QTYPE.SOA,
-                ttl=3600,
-                rdata=dnslib.SOA(
-                    self.selfdomain,
-                    "webmaster." + self.selfdomain,
-                    (20130101, 3600, 3600, 3600, 3600)
+        q_contents = str(dnsq.q.get_qname())
+        
+        if self.delegatedomain in q_contents:
+            delegatedomain = self.delegatedomain
+            selfdomain = self.selfdomain
+        else:
+            try:
+                q_contents_split = q_contents.split('.')
+                delegatedomain = '.'.join(q_contents_split[-5:])
+                selfdomain = '.'.join([q_contents_split[-5]] + q_contents_split[-3:])
+            except Exception:
+                delegatedomain = self.delegatedomain
+                selfdomain = self.selfdomain
+        if dnsq.q.qtype == dnslib.QTYPE.MX:
+            answer = dnsq.reply(ra=1, aa=1)
+            answer.add_answer(
+                *dnslib.RR.fromZone(q_contents + " 3600 MX 10 " + selfdomain))
+        else:
+            answer = dnsq.reply()
+            answer.header = dnslib.DNSHeader(id=dnsq.header.id,
+                                             aa=1, qr=1, ra=1, rcode=3)
+            answer.add_auth(
+                dnslib.RR(
+                    delegatedomain,
+                    dnslib.QTYPE.SOA,
+                    ttl=3600,
+                    rdata=dnslib.SOA(
+                        selfdomain,
+                        "webmaster." + selfdomain,
+                                    (20130101, 3600,
+                                     3600, 3600, 3600)
+                    )
                 )
             )
-        )
         answer.set_header_qa()
         packet = answer.pack()
         self.transport.write(packet, addr)
@@ -198,39 +242,58 @@ class Coordinator(DatagramProtocol):
             # TODO: get obfs level from query length
 
             if self.transmit:
-                main_pw, client_sha1, number, tcp_port, remote_ip, certs_str = \
+                main_pw, client_sha1, number, tcp_port, remote_ip, certs_str, signature = \
                     self.parse_udp_msg_transmit(data)
             else:
-                main_pw, client_sha1, number, tcp_port, remote_ip, certs_str = \
+                main_pw, client_sha1, number, tcp_port, remote_ip, certs_str, signature = \
                     self.parse_udp_msg(*query_data[:6])
-            if number is None:
-                raise CorruptedReq
-            if client_sha1 not in self.controls:
+            if (client_sha1 + main_pw) not in self.controls:
                 cert = self.certs_db.query(client_sha1)
-                control = Control(self, client_sha1, cert[0], cert[1],
+                control = Control(self, signature, client_sha1, cert[0], cert[1],
                                   remote_ip, tcp_port,
                                   main_pw, number, certs_str)
-                self.controls[client_sha1] = control
+                self.controls[client_sha1 + main_pw] = control
             else:
-                control = self.controls[client_sha1]
-                control.update(remote_ip, tcp_port, main_pw, number)
+                control = self.controls[client_sha1 + main_pw]
+                control.update(remote_ip, tcp_port, number)
 
             control.connect()
 
         except CorruptedReq:
-            logging.info("Corrupt request")
+            logging.debug("corrupt request")
         except KeyError:
-            logging.error("untrusted client")
+            logging.warning("untrusted client attempting to connect")
         except AssertionError:
-            logging.error("authentication failed or corrupt request")
-        except ClientAddrChanged:
-            logging.error("client address or port changed")
-        # except Exception as err:
-        #    logging.error("unknown error: " + str(err))
+            logging.debug("authentication failed or corrupt request")
+        except BlacklistReq:
+            logging.debug("request or salt on blacklist")
+        except IllegalReq:
+            logging.debug("request for too many connections")
 
-    def remove_ctl(self, client_sha1):
+    def remove_ctl(self, client_sha1, main_pw):
+        '''Remove reference to the Control instance'''
         try:
-            del self.controls[client_sha1]
-            self.controls.pop(client_sha1)
+            del self.controls[client_sha1 + main_pw]
+            self.controls.pop(client_sha1 + main_pw)
         except Exception:
             pass
+
+    def blacklist_add(self, client_sha1, main_pw):
+        self.blacklist.append(client_sha1 + main_pw)
+        logging.warning(
+            "New blacklist item added: " + client_sha1 + " | " + main_pw)
+        reactor.callLater(
+            BLACKLIST_EXPIRE_TIME, self.blacklist_expire, len(self.blacklist) - 1)
+
+    def blacklist_expire(self, i):
+        self.blacklist.pop(i)
+
+    def blacklist_count(self, client_sha1, main_pw):
+        if (client_sha1 + main_pw) not in self.blacklist:
+            if (client_sha1 + main_pw) in self.blacklist_buffer:
+                self.blacklist_buffer[client_sha1 + main_pw] += 1
+                if self.blacklist_buffer[client_sha1 + main_pw] >= 10:
+                    self.blacklist_add(client_sha1, main_pw)
+                    self.blacklist_buffer.pop(client_sha1 + main_pw)
+            else:
+                self.blacklist_buffer[client_sha1 + main_pw] = 1

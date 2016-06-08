@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+# coding:utf-8
+
 import logging
 from collections import deque
 from random import expovariate
@@ -14,10 +17,9 @@ import sys
 from proxy import ProxyConnector
 from utils import addr_to_str
 from client import ClientConnector
-from meekserver import meekinit, meekterm
+from meekserver import meek
 import psutil
 import atexit
-EXPIRE_TIME = 5
 
 
 def exit_handler():
@@ -47,9 +49,10 @@ class Control:
         spawned from it as the `initiator` parameter.
     """
 
-    def __init__(self, initiator, client_sha1, client_pub, client_pri_sha1,
+    def __init__(self, initiator, signature_to_client, client_sha1, client_pub, client_pri_sha1,
                  host, port, main_pw, req_num, certs_str=None):
         self.initiator = initiator
+        self.signature_to_client = signature_to_client
         self.socksproxy = self.initiator.socksproxy
         self.close_char = chr(4) * 5
         self.client_sha1 = client_sha1
@@ -109,16 +112,25 @@ class Control:
         # meek (GAE) init
         if self.obfs_level == 3:
             self.ptproxy_local_port = None
+            if "appspot.com" in self.initiator.meek_url:
+                logging.info("Using GAE mode for appspot.com detected in URL.")
+                cmdline = self.initiator.pt_exec + \
+                    " --url=" + self.initiator.meek_url + \
+                    " --desturl=http://" + self.host + \
+                    ":" + str(self.port) + "/"
+            else:
+                logging.info("Using CDN mode with " + self.initiator.meek_url)
+                cmdline = self.initiator.pt_exec + \
+                    " --url=" + self.initiator.meek_url
             self.check = threading.Event()
             meek_var = {
-                "ptexec": self.initiator.pt_exec +
-                " --url=" + self.initiator.meek_url +
-                " --desturl=http://" + self.host + ":" + str(self.port) + "/",
+                "ptexec": cmdline,
                 "localport": self.ptproxy_local_port,
                 "LOCK": self.check
             }
+            self.meek = meek(self, meek_var)
             pt = threading.Thread(
-                target=meekinit, args=[self, meek_var])
+                target=self.meek.meekinit)
             pt.setDaemon(True)
             pt.start()
             self.check.wait(100)
@@ -137,7 +149,7 @@ class Control:
             # experimental function
     #    reactor.callLater(1, self.broadcast)
 
-    def update(self, host, port, main_pw, req_num):
+    def update(self, host, port, req_num):
         # Update the info in control object, called when different data come in
         # by new requests
         if self.original_host != host or self.original_port != port:
@@ -150,9 +162,6 @@ class Control:
         if self.req_num < req_num:
             # Reduce req_num when working is not permitted
             self.client_connectors_pool += [None] * (req_num - self.req_num)
-        if self.main_pw != main_pw:
-            self.main_pw = main_pw
-            logging.info("main password change")
 
     def connect(self):
         """Connect client."""
@@ -192,6 +201,7 @@ class Control:
             self.retry_count += 1
             self.connect()
         elif all(_ is None for _ in self.client_connectors_pool):
+            self.initiator.blacklist_count(self.client_sha1, self.main_pw)
             self.dispose()
 
     def success(self, conn):
@@ -223,6 +233,10 @@ class Control:
             else:
                 conn.write(self.close_char, "00", "100000")
                 conn.close()
+                if all((_ is None) or (_ == 1) for _ in self.client_connectors_pool):
+                    self.initiator.blacklist_count(
+                        self.client_sha1, self.main_pw)
+                    self.dispose()
             # TODO: ADD to some black list?
 
     def add_cli(self, conn):
@@ -355,10 +369,11 @@ class Control:
 
         May result in better performance.
         """
-        reactor.callLater(0.1, self.client_reset_exec, conn)
-        self.client_lost(conn)
         conn.write(self.close_char, "00", "100000")
-        conn.authenticated = False
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     def client_reset_exec(self, conn):
         try:
@@ -366,18 +381,14 @@ class Control:
         except Exception:
             pass
 
-    def client_lost(self, conn):
+    def client_lost(self, i):
         """Triggered by a ClientConnector's connectionLost method.
 
         Remove the closed connection and retry creating it.
         """
-        if conn in self.client_connectors_pool:
-            i = self.client_connectors_pool.index(conn)
-            self.client_connectors_pool[i] = None
-        elif self.client_connectors_pool[conn.i] == 1:
-            self.client_connectors_pool[conn.i] = None
+        self.client_connectors_pool[i] = None
         # Disable immediate connect seems to improve performance. #TODO: Why?
-        # self.connect()
+        self.connect()
 
     def register(self):
         for i in range(self.req_num):
@@ -501,7 +512,7 @@ class Control:
 
     def dispose(self):
         if self.obfs_level == 3:
-            meekterm()
+            self.meek.meekterm()
         try:
             for i in self.client_connectors_pool:
                 i.loseConnection()
@@ -513,7 +524,7 @@ class Control:
             self.proxy_connectors_dict = None
         except Exception:
             pass
-        self.initiator.remove_ctl(self.client_sha1)
+        self.initiator.remove_ctl(self.client_sha1, self.main_pw)
 
 # TODO: use the same strategy for proxy and client, to avoid error with large
 # upload files
